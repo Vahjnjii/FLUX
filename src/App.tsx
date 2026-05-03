@@ -106,6 +106,12 @@ export default function App() {
         showMessage("Please enter your name.", 'error');
         return;
       }
+      
+      // Clear current memory for fresh identity
+      setApiKeys([]);
+      setProfiles([]);
+      setResults([]);
+      
       setSettings(prev => ({ 
         ...prev, 
         accessCode: authInput, 
@@ -114,47 +120,58 @@ export default function App() {
         sessionStartedAt: Date.now()
       }));
       setIsUnlocked(true);
-      showMessage(`Welcome, ${nameInput}. Your personal vault is ready.`, 'success');
+      showMessage(`Identity Forge Complete. Welcome, ${nameInput}.`, 'success');
     } else {
       // Login Mode
-      // Check local storage first
       if (settings.accessCode) {
         if (authInput === settings.accessCode) {
           setSettings(prev => ({ ...prev, sessionStartedAt: Date.now() }));
           setIsUnlocked(true);
-          showMessage(`Access Granted. Welcome back, ${settings.userName}.`, 'success');
+          showMessage(`Vault Unlocked. Greetings, ${settings.userName}.`, 'success');
         } else {
-          showMessage("Incorrect code.", 'error');
+          showMessage("Access Denied. Invalid Authorization Code.", 'error');
         }
       } else {
-        // Recovery Mode (No local data, try to pull from cloud)
-        if (!showCloudRecovery) {
+        // New Device / No local vault
+        if (!recoverToken || !recoverRepo || !nameInput) {
           setShowCloudRecovery(true);
-          showMessage("Local vault not found. Please provide cloud credentials to recover.", 'info');
-        } else {
-          if (!recoverToken || !recoverRepo) {
-            showMessage("Token and Repository are required for recovery.", 'error');
-            return;
-          }
+          showMessage("Local vault not found. Enter your Name, Token, and Repo to restore from Cloud.", 'info');
+          return;
+        }
+
+        try {
+          setIsProcessing(true);
+          const path = `vault_${authInput}_${nameInput.toLowerCase().replace(/\s/g, '_')}.json`;
+          const url = `https://api.github.com/repos/${recoverRepo}/contents/${path}`;
+          const res = await fetch(url, {
+            headers: { 'Authorization': `token ${recoverToken}` }
+          });
+
+          if (!res.ok) throw new Error("Vault not found in this repository for this identity.");
+
+          const data = await res.json();
+          const utf8SafeDecode = (b64: string) => decodeURIComponent(escape(atob(b64)));
+          const vault = JSON.parse(utf8SafeDecode(data.content));
+
+          // Set all states from recovered vault
+          if (vault.apiKeys) setApiKeys(vault.apiKeys);
+          if (vault.profiles) setProfiles(vault.profiles);
+          if (vault.results) setResults(vault.results);
           
-          // Temporary apply settings for the pull attempt
-          const tempPath = `vault_${authInput}_${nameInput.toLowerCase().replace(/\s/g, '_')}.json`;
-          
-          try {
-            const url = `https://api.github.com/repos/${recoverRepo}/contents/vault_${authInput}_${nameInput.toLowerCase().replace(/\s/g, '_')}.json`;
-            // Note: This assumes path is derived from Name/Pin. If they forgot Name, they might need to try multiple.
-            // Or we just try generic paths.
-            
-            showMessage("Attempting cloud recovery...", 'info');
-            
-            // This is complex because we don't know the exact filename if it was custom.
-            // We'll let the user provide the info in Settings instead if they are just "logging in" on a new device.
-            // For now, let's keep it simple: If they are on a new device, they "Register" then add Cloud info in settings.
-            
-            showMessage("New device detected. Please 'Register' or configure Cloud Storage in Settings.", 'warning');
-          } catch (err) {
-            showMessage("Recovery failed.", 'error');
-          }
+          const newSettings = {
+            ...vault.settings,
+            githubToken: recoverToken,
+            githubRepo: recoverRepo,
+            sessionStartedAt: Date.now()
+          };
+          setSettings(newSettings);
+          setIsUnlocked(true);
+          setIsCloudLoaded(true);
+          showMessage("Identity recovered from Historian Cloud!", 'success');
+        } catch (err: any) {
+          showMessage(err.message || "Recovery failed.", 'error');
+        } finally {
+          setIsProcessing(false);
         }
       }
     }
@@ -2222,15 +2239,46 @@ Return the response as a raw JSON string.`;
 
                 <div className="space-y-5">
                   {(authMode === 'register' || (authMode === 'login' && !settings.accessCode)) && (
-                    <div className="space-y-2">
-                       <label className="text-[9px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-1">Your Name</label>
-                       <input 
-                        type="text"
-                        placeholder="Operator Name"
-                        value={nameInput}
-                        onChange={(e) => setNameInput(e.target.value)}
-                        className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm focus:outline-none focus:ring-2 ring-black/5 text-center"
-                      />
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <label className="text-[9px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-1">Your Name</label>
+                        <input 
+                          type="text"
+                          placeholder="Operator Name"
+                          value={nameInput}
+                          onChange={(e) => setNameInput(e.target.value)}
+                          className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm focus:outline-none focus:ring-2 ring-black/5 text-center"
+                        />
+                      </div>
+                      
+                      {authMode === 'login' && showCloudRecovery && (
+                        <motion.div 
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: 'auto', opacity: 1 }}
+                          className="space-y-4 overflow-hidden"
+                        >
+                           <div className="space-y-2">
+                            <label className="text-[9px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-1">Cloud Token (PAT)</label>
+                            <input 
+                              type="password"
+                              placeholder="ghp_..."
+                              value={recoverToken}
+                              onChange={(e) => setRecoverToken(e.target.value)}
+                              className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm focus:outline-none focus:ring-2 ring-black/5 text-center"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-[9px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-1">Cloud Repository</label>
+                            <input 
+                              type="text"
+                              placeholder="user/repo"
+                              value={recoverRepo}
+                              onChange={(e) => setRecoverRepo(e.target.value)}
+                              className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm focus:outline-none focus:ring-2 ring-black/5 text-center"
+                            />
+                          </div>
+                        </motion.div>
+                      )}
                     </div>
                   )}
 
