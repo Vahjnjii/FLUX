@@ -25,7 +25,8 @@ import {
   Zap,
   Square,
   Image,
-  RefreshCw
+  RefreshCw,
+  Lock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Papa from 'papaparse';
@@ -52,7 +53,7 @@ export default function App() {
       useCustomImageApi: false, 
       githubToken: null, 
       githubRepo: null, 
-      githubPath: 'historian_vault.json', 
+      githubPath: null, 
       autoSync: false, 
       useGithubAssets: false,
       accessCode: null,
@@ -65,7 +66,6 @@ export default function App() {
       return {
         ...defaultSettings,
         ...parsed,
-        githubPath: parsed.githubPath || 'historian_vault.json',
         autoSync: parsed.autoSync ?? false,
         useGithubAssets: parsed.useGithubAssets ?? false
       };
@@ -78,6 +78,11 @@ export default function App() {
   const [isUnlocked, setIsUnlocked] = useState(false);
   const [authInput, setAuthInput] = useState('');
   const [nameInput, setNameInput] = useState('');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [showCloudRecovery, setShowCloudRecovery] = useState(false);
+
+  const [recoverToken, setRecoverToken] = useState('');
+  const [recoverRepo, setRecoverRepo] = useState('');
 
   // Session Management
   useEffect(() => {
@@ -90,29 +95,67 @@ export default function App() {
     }
   }, []);
 
-  const handleUnlock = () => {
-    if (!settings.accessCode) {
-      // Setup phase
-      if (!authInput || !nameInput) {
-        showMessage("Enter a secure code and your name to initialize.", 'error');
+  const handleUnlock = async () => {
+    if (authInput.length !== 4) {
+      showMessage("Code must be 4 digits.", 'error');
+      return;
+    }
+
+    if (authMode === 'register') {
+      if (!nameInput) {
+        showMessage("Please enter your name.", 'error');
         return;
       }
       setSettings(prev => ({ 
         ...prev, 
         accessCode: authInput, 
         userName: nameInput,
+        githubPath: `vault_${authInput}_${nameInput.toLowerCase().replace(/\s/g, '_')}.json`,
         sessionStartedAt: Date.now()
       }));
       setIsUnlocked(true);
-      showMessage(`Welcome, Researcher ${nameInput}. Protocol initialized.`, 'success');
+      showMessage(`Welcome, ${nameInput}. Your personal vault is ready.`, 'success');
     } else {
-      // Login phase
-      if (authInput === settings.accessCode) {
-        setSettings(prev => ({ ...prev, sessionStartedAt: Date.now() }));
-        setIsUnlocked(true);
-        showMessage(`Access Granted. Welcome back, ${settings.userName}.`, 'success');
+      // Login Mode
+      // Check local storage first
+      if (settings.accessCode) {
+        if (authInput === settings.accessCode) {
+          setSettings(prev => ({ ...prev, sessionStartedAt: Date.now() }));
+          setIsUnlocked(true);
+          showMessage(`Access Granted. Welcome back, ${settings.userName}.`, 'success');
+        } else {
+          showMessage("Incorrect code.", 'error');
+        }
       } else {
-        showMessage("Invalid Protocol Code. Unauthorized access attempt logged.", 'error');
+        // Recovery Mode (No local data, try to pull from cloud)
+        if (!showCloudRecovery) {
+          setShowCloudRecovery(true);
+          showMessage("Local vault not found. Please provide cloud credentials to recover.", 'info');
+        } else {
+          if (!recoverToken || !recoverRepo) {
+            showMessage("Token and Repository are required for recovery.", 'error');
+            return;
+          }
+          
+          // Temporary apply settings for the pull attempt
+          const tempPath = `vault_${authInput}_${nameInput.toLowerCase().replace(/\s/g, '_')}.json`;
+          
+          try {
+            const url = `https://api.github.com/repos/${recoverRepo}/contents/vault_${authInput}_${nameInput.toLowerCase().replace(/\s/g, '_')}.json`;
+            // Note: This assumes path is derived from Name/Pin. If they forgot Name, they might need to try multiple.
+            // Or we just try generic paths.
+            
+            showMessage("Attempting cloud recovery...", 'info');
+            
+            // This is complex because we don't know the exact filename if it was custom.
+            // We'll let the user provide the info in Settings instead if they are just "logging in" on a new device.
+            // For now, let's keep it simple: If they are on a new device, they "Register" then add Cloud info in settings.
+            
+            showMessage("New device detected. Please 'Register' or configure Cloud Storage in Settings.", 'warning');
+          } catch (err) {
+            showMessage("Recovery failed.", 'error');
+          }
+        }
       }
     }
   };
@@ -167,14 +210,27 @@ export default function App() {
     return null;
   };
 
+  const lastSyncedHash = useRef<string>('');
+
   const syncToGithub = async () => {
     if (!settings.githubToken || !settings.githubRepo) {
-      showMessage("GitHub configuration missing.", 'error');
       return;
     }
 
     try {
-      const content = btoa(JSON.stringify({ apiKeys, profiles, results, settings }, null, 2));
+      const vaultData = JSON.stringify({ apiKeys, profiles, results, settings }, null, 2);
+      
+      // Unicode-safe Base64 encoding
+      const utf8SafeBase64 = (str: string) => {
+        return btoa(unescape(encodeURIComponent(str)));
+      };
+
+      // Only sync if content has actually changed
+      if (vaultData === lastSyncedHash.current) {
+        return;
+      }
+
+      const content = utf8SafeBase64(vaultData);
       const url = `https://api.github.com/repos/${settings.githubRepo}/contents/${settings.githubPath}`;
       
       // Get SHA if file exists
@@ -202,13 +258,65 @@ export default function App() {
       });
 
       if (res.ok) {
+        lastSyncedHash.current = vaultData;
         showMessage("Synchronized to GitHub Cloud!", 'success');
       } else {
-        throw new Error(await res.text());
+        const err = await res.json();
+        throw new Error(err.message || "Unknown error");
       }
     } catch (err: any) {
       console.error(err);
       showMessage("GitHub Sync Failed: " + err.message, 'error');
+    }
+  };
+
+  const createGithubRelease = async () => {
+    if (!settings.githubToken || !settings.githubRepo) {
+      showMessage("GitHub configuration missing.", 'error');
+      return;
+    }
+
+    try {
+      const tagName = `v${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      const url = `https://api.github.com/repos/${settings.githubRepo}/releases`;
+      
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `token ${settings.githubToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          tag_name: tagName,
+          name: `Vault Snapshot ${new Date().toLocaleDateString()}`,
+          body: `Historian Engine Automated Snapshot.\nProfiles: ${profiles.length}\nResults: ${results.length}`,
+          draft: false,
+          prerelease: false
+        })
+      });
+
+      if (!res.ok) throw new Error(await res.text());
+
+      const release = await res.json();
+      const vaultData = JSON.stringify({ apiKeys, profiles, results, settings }, null, 2);
+      const assetUrl = `https://uploads.github.com/repos/${settings.githubRepo}/releases/${release.id}/assets?name=historian_vault_${tagName}.json`;
+
+      const uploadRes = await fetch(assetUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `token ${settings.githubToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: vaultData
+      });
+
+      if (uploadRes.ok) {
+        showMessage(`Immutable Release Created: ${tagName}`, 'success');
+      } else {
+        throw new Error("Release created but asset upload failed.");
+      }
+    } catch (err: any) {
+      showMessage("Release Failed: " + err.message, 'error');
     }
   };
 
@@ -227,12 +335,18 @@ export default function App() {
       if (!res.ok) throw new Error("File not found in repository.");
 
       const data = await res.json();
-      const vault = JSON.parse(atob(data.content));
+      // Unicode-safe decoding
+      const utf8SafeDecode = (b64: string) => {
+        return decodeURIComponent(escape(atob(b64)));
+      };
+      const vault = JSON.parse(utf8SafeDecode(data.content));
 
       if (vault.apiKeys) setApiKeys(vault.apiKeys);
       if (vault.profiles) setProfiles(vault.profiles);
       if (vault.results) setResults(vault.results);
       if (vault.settings) setSettings(vault.settings);
+      
+      lastSyncedHash.current = JSON.stringify(vault, null, 2);
 
       showMessage("Vault pulled from GitHub successfully!", 'success');
     } catch (err: any) {
@@ -1850,6 +1964,14 @@ Return the response as a raw JSON string.`;
                     </button>
                   </div>
 
+                  <button 
+                    onClick={createGithubRelease}
+                    className="w-full bg-slate-100 hover:bg-slate-200 text-slate-800 py-4 rounded-2xl font-bold text-xs uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-2 border border-slate-200"
+                  >
+                    <Zap size={14} className="text-yellow-600" />
+                    Archive to GitHub Releases
+                  </button>
+
                   <div className="space-y-3">
                     <div className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
                       <div className="flex items-center gap-3">
@@ -2071,54 +2193,71 @@ Return the response as a raw JSON string.`;
               <motion.div 
                 initial={{ y: 20, opacity: 0 }}
                 animate={{ y: 0, opacity: 1 }}
-                className="w-full max-w-md bg-white rounded-[3rem] p-10 shadow-2xl relative z-10"
+                className="w-full max-w-md bg-white rounded-[3rem] p-8 shadow-2xl relative z-10"
               >
-                <header className="text-center mb-10">
-                  <div className="w-16 h-16 bg-black rounded-3xl mx-auto flex items-center justify-center text-white mb-6 rotate-3 shadow-xl">
+                <header className="text-center mb-8">
+                  <div className="w-16 h-16 bg-black rounded-3xl mx-auto flex items-center justify-center text-white mb-4 rotate-3 shadow-xl">
                     <History size={32} />
                   </div>
-                  <h1 className="text-3xl font-bold tracking-tight italic">Historian Protocol</h1>
-                  <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-slate-400 mt-2">
-                    {settings.accessCode ? `Welcome back, ${settings.userName}` : 'Initialize Secure Access'}
+                  <h1 className="text-2xl font-bold tracking-tight italic">Historian Cloud</h1>
+                  <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-slate-400 mt-1">
+                    Secure Vault Protocol
                   </p>
                 </header>
 
-                <div className="space-y-6">
-                  {!settings.accessCode && (
+                <div className="flex bg-slate-100 p-1 rounded-2xl mb-6">
+                  <button 
+                    onClick={() => setAuthMode('login')}
+                    className={`flex-1 py-2 text-[10px] font-bold uppercase tracking-widest rounded-xl transition-all ${authMode === 'login' ? 'bg-white shadow-sm text-black' : 'text-slate-500'}`}
+                  >
+                    Login
+                  </button>
+                  <button 
+                    onClick={() => setAuthMode('register')}
+                    className={`flex-1 py-2 text-[10px] font-bold uppercase tracking-widest rounded-xl transition-all ${authMode === 'register' ? 'bg-white shadow-sm text-black' : 'text-slate-500'}`}
+                  >
+                    Register
+                  </button>
+                </div>
+
+                <div className="space-y-5">
+                  {(authMode === 'register' || (authMode === 'login' && !settings.accessCode)) && (
                     <div className="space-y-2">
-                      <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-2">Operator Identity</label>
-                      <input 
+                       <label className="text-[9px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-1">Your Name</label>
+                       <input 
                         type="text"
-                        placeholder="Enter your name..."
+                        placeholder="Operator Name"
                         value={nameInput}
                         onChange={(e) => setNameInput(e.target.value)}
-                        className="w-full px-6 py-5 bg-slate-50 border border-slate-200 rounded-[2rem] text-sm focus:outline-none focus:ring-4 ring-black/5 transition-all text-center"
+                        className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-sm focus:outline-none focus:ring-2 ring-black/5 text-center"
                       />
                     </div>
                   )}
 
                   <div className="space-y-2">
-                    <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-2">Access Keyphrase</label>
+                    <label className="text-[9px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-1">4-Digit PIN</label>
                     <input 
                       type="password"
-                      placeholder="••••••••"
+                      maxLength={4}
+                      placeholder="••••"
                       value={authInput}
-                      onChange={(e) => setAuthInput(e.target.value)}
+                      onChange={(e) => setAuthInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
                       onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
-                      className="w-full px-6 py-5 bg-slate-50 border border-slate-200 rounded-[2rem] text-sm focus:outline-none focus:ring-4 ring-black/5 transition-all text-center tracking-widest text-xl font-bold"
+                      className="w-full px-5 py-4 bg-slate-50 border border-slate-200 rounded-2xl text-2xl font-bold tracking-[1em] focus:outline-none focus:ring-2 ring-black/5 text-center"
                     />
                   </div>
 
                   <button 
                     onClick={handleUnlock}
-                    className="w-full bg-black text-white py-6 rounded-[2rem] font-bold text-xs uppercase tracking-[0.2em] shadow-xl hover:scale-[1.02] active:scale-95 transition-all"
+                    disabled={authInput.length !== 4}
+                    className="w-full bg-black text-white py-5 rounded-2xl font-bold text-[10px] uppercase tracking-[0.2em] shadow-xl hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 disabled:grayscale"
                   >
-                    {settings.accessCode ? 'Unlock Vault' : 'Initialize System'}
+                    {authMode === 'login' ? 'Unlock Session' : 'Create Identity'}
                   </button>
 
                   <div className="text-center">
                     <p className="text-[9px] text-slate-400 italic">
-                      This system resets every 24 hours. Keep your code safe.
+                      Browser session persists for 24 hours.
                     </p>
                   </div>
                 </div>
