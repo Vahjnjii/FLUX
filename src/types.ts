@@ -33,6 +33,10 @@ export interface AppSettings {
   githubRepo: string | null;
   githubPath: string | null;
   autoSync: boolean;
+  useGithubAssets: boolean;
+  accessCode: string | null;
+  userName: string | null;
+  sessionStartedAt: number | null;
 }
 
 export interface AppState {

@@ -47,28 +47,125 @@ export default function App() {
   });
   const [settings, setSettings] = useState<AppSettings>(() => {
     const saved = localStorage.getItem('history_settings');
-    if (!saved) return { imageNodes: [], useCustomImageApi: false, githubToken: null, githubRepo: null, githubPath: 'historian_vault.json', autoSync: false };
+    const defaultSettings = { 
+      imageNodes: [], 
+      useCustomImageApi: false, 
+      githubToken: null, 
+      githubRepo: null, 
+      githubPath: 'historian_vault.json', 
+      autoSync: false, 
+      useGithubAssets: false,
+      accessCode: null,
+      userName: null,
+      sessionStartedAt: null
+    };
+    if (!saved) return defaultSettings;
     try {
       const parsed = JSON.parse(saved);
-      if (parsed.customImageApiUrl && (!parsed.imageNodes || parsed.imageNodes.length === 0)) {
-        return {
-          imageNodes: [{ url: parsed.customImageApiUrl, cooldownUntil: null }],
-          useCustomImageApi: parsed.useCustomImageApi,
-          githubToken: null,
-          githubRepo: null,
-          githubPath: 'historian_vault.json',
-          autoSync: false
-        };
-      }
       return {
+        ...defaultSettings,
         ...parsed,
         githubPath: parsed.githubPath || 'historian_vault.json',
-        autoSync: parsed.autoSync ?? false
+        autoSync: parsed.autoSync ?? false,
+        useGithubAssets: parsed.useGithubAssets ?? false
       };
     } catch { 
-      return { imageNodes: [], useCustomImageApi: false, githubToken: null, githubRepo: null, githubPath: 'historian_vault.json', autoSync: false }; 
+      return defaultSettings; 
     }
   });
+
+  const [isCloudLoaded, setIsCloudLoaded] = useState(false);
+  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [authInput, setAuthInput] = useState('');
+  const [nameInput, setNameInput] = useState('');
+
+  // Session Management
+  useEffect(() => {
+    if (settings.accessCode && settings.sessionStartedAt) {
+      const dayInMs = 24 * 60 * 60 * 1000;
+      const isExpired = Date.now() - settings.sessionStartedAt > dayInMs;
+      if (!isExpired) {
+        setIsUnlocked(true);
+      }
+    }
+  }, []);
+
+  const handleUnlock = () => {
+    if (!settings.accessCode) {
+      // Setup phase
+      if (!authInput || !nameInput) {
+        showMessage("Enter a secure code and your name to initialize.", 'error');
+        return;
+      }
+      setSettings(prev => ({ 
+        ...prev, 
+        accessCode: authInput, 
+        userName: nameInput,
+        sessionStartedAt: Date.now()
+      }));
+      setIsUnlocked(true);
+      showMessage(`Welcome, Researcher ${nameInput}. Protocol initialized.`, 'success');
+    } else {
+      // Login phase
+      if (authInput === settings.accessCode) {
+        setSettings(prev => ({ ...prev, sessionStartedAt: Date.now() }));
+        setIsUnlocked(true);
+        showMessage(`Access Granted. Welcome back, ${settings.userName}.`, 'success');
+      } else {
+        showMessage("Invalid Protocol Code. Unauthorized access attempt logged.", 'error');
+      }
+    }
+  };
+
+  const handleLogout = () => {
+    setSettings(prev => ({ ...prev, sessionStartedAt: null }));
+    setIsUnlocked(false);
+    setAuthInput('');
+  };
+
+  // Initial Cloud Sync
+  useEffect(() => {
+    if (settings.githubToken && settings.githubRepo && !isCloudLoaded) {
+      pullFromGithub().finally(() => setIsCloudLoaded(true));
+    }
+  }, []);
+
+  const uploadToGithub = async (path: string, base64Content: string, message: string) => {
+    if (!settings.githubToken || !settings.githubRepo) return null;
+    
+    // Remove data:image/png;base64, prefix if present
+    const cleanBase64 = base64Content.replace(/^data:image\/\w+;base64,/, '');
+    const url = `https://api.github.com/repos/${settings.githubRepo}/contents/${path}`;
+    
+    // Check if exists for SHA
+    const getFile = await fetch(url, {
+      headers: { 'Authorization': `token ${settings.githubToken}` }
+    });
+    let sha: string | undefined;
+    if (getFile.ok) {
+      const data = await getFile.json();
+      sha = data.sha;
+    }
+
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `token ${settings.githubToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message,
+        content: cleanBase64,
+        sha
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return data.content.download_url || `https://raw.githubusercontent.com/${settings.githubRepo}/main/${path}`;
+    }
+    return null;
+  };
 
   const syncToGithub = async () => {
     if (!settings.githubToken || !settings.githubRepo) {
@@ -597,6 +694,15 @@ export default function App() {
     });
   };
 
+  const processImageResult = async (base64: string, topic: string) => {
+    if (settings.useGithubAssets && settings.githubToken && settings.githubRepo) {
+      const filename = `assets/${topic.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.png`;
+      const url = await uploadToGithub(filename, base64, `Upload asset: ${topic}`);
+      return url || `data:image/png;base64,${base64}`;
+    }
+    return `data:image/png;base64,${base64}`;
+  };
+
   const processBatch = async () => {
     if (isProcessing) return;
     if (csvData.length === 0) {
@@ -710,14 +816,16 @@ Return the response as a raw JSON string.`;
           }
 
           const composited = await compositeImage(base64Img, textData.short, currentProfile.logoUrl);
+          const finalImageUrl = await processImageResult(base64Img, res.topic);
+          const finalCompositedUrl = await processImageResult(composited, res.topic + "_composited");
 
           setResults(prev => prev.map(r => r.id === res.id ? { 
             ...r, 
             status: 'done',
             shortText: textData.short,
             longText: textData.long,
-            imageUrl: `data:image/png;base64,${base64Img}`,
-            compositedImageUrl: composited
+            imageUrl: finalImageUrl,
+            compositedImageUrl: finalCompositedUrl
           } : r));
 
           if (exportDirHandle) {
@@ -818,14 +926,16 @@ Return the response as a raw JSON string.`;
           }
 
           const composited = await compositeImage(base64Img, textData.short, currentProfile.logoUrl);
+          const finalImageUrl = await processImageResult(base64Img, res.topic);
+          const finalCompositedUrl = await processImageResult(composited, res.topic + "_composited");
 
           setResults(prev => prev.map(r => r.id === res.id ? { 
             ...r, 
             status: 'done', 
             shortText: textData.short, 
             longText: textData.long, 
-            imageUrl: `data:image/jpeg;base64,${base64Img}`, 
-            compositedImageUrl: composited
+            imageUrl: finalImageUrl, 
+            compositedImageUrl: finalCompositedUrl
           } : r));
 
           if (exportDirHandle) {
@@ -1740,21 +1850,46 @@ Return the response as a raw JSON string.`;
                     </button>
                   </div>
 
-                  <div className="flex items-center justify-between p-4 bg-slate-900 rounded-2xl border border-slate-700">
-                    <div className="flex items-center gap-3">
-                      <RefreshCw size={18} className={settings.autoSync ? "text-yellow-500 animate-[spin_4s_linear_infinite]" : "text-slate-500"} />
-                      <div>
-                        <h4 className="text-[10px] font-bold uppercase tracking-widest text-white">Live Auto-Sync</h4>
-                        <p className="text-[9px] text-slate-400">Push changes automatically to GitHub</p>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                      <div className="flex items-center gap-3">
+                        <ImageIcon size={18} className="text-slate-500" />
+                        <div>
+                          <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-900">Media Offloading</h4>
+                          <p className="text-[9px] text-slate-400">Save images as files in /assets/ folder</p>
+                        </div>
                       </div>
+                      <button 
+                        onClick={() => setSettings(prev => ({ ...prev, useGithubAssets: !prev.useGithubAssets }))}
+                        className={`w-10 h-5 rounded-full transition-all relative ${settings.useGithubAssets ? 'bg-black' : 'bg-slate-200'}`}
+                      >
+                        <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all ${settings.useGithubAssets ? 'left-5.5' : 'left-0.5'}`}></div>
+                      </button>
                     </div>
-                    <button 
-                      onClick={() => setSettings(prev => ({ ...prev, autoSync: !prev.autoSync }))}
-                      className={`w-10 h-5 rounded-full transition-all relative ${settings.autoSync ? 'bg-yellow-500' : 'bg-slate-700'}`}
-                    >
-                      <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all ${settings.autoSync ? 'left-5.5' : 'left-0.5'}`}></div>
-                    </button>
+
+                    <div className="flex items-center justify-between p-4 bg-slate-900 rounded-2xl border border-slate-700">
+                      <div className="flex items-center gap-3">
+                        <RefreshCw size={18} className={settings.autoSync ? "text-yellow-500 animate-[spin_4s_linear_infinite]" : "text-slate-500"} />
+                        <div>
+                          <h4 className="text-[10px] font-bold uppercase tracking-widest text-white">Live Auto-Sync</h4>
+                          <p className="text-[9px] text-slate-400">Push changes automatically to GitHub</p>
+                        </div>
+                      </div>
+                      <button 
+                        onClick={() => setSettings(prev => ({ ...prev, autoSync: !prev.autoSync }))}
+                        className={`w-10 h-5 rounded-full transition-all relative ${settings.autoSync ? 'bg-yellow-500' : 'bg-slate-700'}`}
+                      >
+                        <div className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-all ${settings.autoSync ? 'left-5.5' : 'left-0.5'}`}></div>
+                      </button>
+                    </div>
                   </div>
+                  
+                  {isCloudLoaded && (
+                    <div className="flex items-center gap-2 justify-center py-2">
+                       <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse"></div>
+                       <span className="text-[9px] font-bold text-green-600 uppercase tracking-widest">Linked to Cloud Source</span>
+                    </div>
+                  )}
                   <p className="text-[10px] text-slate-400 text-center italic">
                     Uses GitHub REST API to store your JSON vault for free.
                   </p>
@@ -1802,6 +1937,14 @@ Return the response as a raw JSON string.`;
                         3. Restore the Vault in your new URL.
                       </p>
                    </div>
+
+                   <button 
+                     onClick={handleLogout}
+                     className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold text-[10px] uppercase tracking-widest hover:scale-105 active:scale-95 transition-all flex items-center justify-center gap-2"
+                   >
+                     <Lock size={14} />
+                     Lock Session
+                   </button>
 
                    <button 
                      onClick={() => {
@@ -1903,6 +2046,81 @@ Return the response as a raw JSON string.`;
                       </button>
                     </div>
                   </section>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <AnimatePresence>
+          {!isUnlocked && (
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-slate-950 z-[200] flex items-center justify-center p-6"
+            >
+              <div className="absolute inset-0 opacity-20 pointer-events-none overflow-hidden">
+                <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_50%_50%,#ffffff10_0%,transparent_100%)]"></div>
+                <div className="grid grid-cols-12 gap-8 opacity-20">
+                   {Array.from({length: 120}).map((_, i) => (
+                     <div key={i} className="h-px bg-white/20"></div>
+                   ))}
+                </div>
+              </div>
+
+              <motion.div 
+                initial={{ y: 20, opacity: 0 }}
+                animate={{ y: 0, opacity: 1 }}
+                className="w-full max-w-md bg-white rounded-[3rem] p-10 shadow-2xl relative z-10"
+              >
+                <header className="text-center mb-10">
+                  <div className="w-16 h-16 bg-black rounded-3xl mx-auto flex items-center justify-center text-white mb-6 rotate-3 shadow-xl">
+                    <History size={32} />
+                  </div>
+                  <h1 className="text-3xl font-bold tracking-tight italic">Historian Protocol</h1>
+                  <p className="text-[10px] font-mono uppercase tracking-[0.3em] text-slate-400 mt-2">
+                    {settings.accessCode ? `Welcome back, ${settings.userName}` : 'Initialize Secure Access'}
+                  </p>
+                </header>
+
+                <div className="space-y-6">
+                  {!settings.accessCode && (
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-2">Operator Identity</label>
+                      <input 
+                        type="text"
+                        placeholder="Enter your name..."
+                        value={nameInput}
+                        onChange={(e) => setNameInput(e.target.value)}
+                        className="w-full px-6 py-5 bg-slate-50 border border-slate-200 rounded-[2rem] text-sm focus:outline-none focus:ring-4 ring-black/5 transition-all text-center"
+                      />
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-slate-400 px-2 ml-2">Access Keyphrase</label>
+                    <input 
+                      type="password"
+                      placeholder="••••••••"
+                      value={authInput}
+                      onChange={(e) => setAuthInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
+                      className="w-full px-6 py-5 bg-slate-50 border border-slate-200 rounded-[2rem] text-sm focus:outline-none focus:ring-4 ring-black/5 transition-all text-center tracking-widest text-xl font-bold"
+                    />
+                  </div>
+
+                  <button 
+                    onClick={handleUnlock}
+                    className="w-full bg-black text-white py-6 rounded-[2rem] font-bold text-xs uppercase tracking-[0.2em] shadow-xl hover:scale-[1.02] active:scale-95 transition-all"
+                  >
+                    {settings.accessCode ? 'Unlock Vault' : 'Initialize System'}
+                  </button>
+
+                  <div className="text-center">
+                    <p className="text-[9px] text-slate-400 italic">
+                      This system resets every 24 hours. Keep your code safe.
+                    </p>
+                  </div>
                 </div>
               </motion.div>
             </motion.div>
