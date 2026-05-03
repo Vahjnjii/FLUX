@@ -1,0 +1,6 @@
+{
+  "name": "Remix: History Post Generator",
+  "description": "AI-powered tool to generate English Facebook posts for the history niche using Gemini 1.5 Flash and Imagen 3.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
